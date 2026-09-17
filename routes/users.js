@@ -81,19 +81,29 @@ router.put("/:id", async (req, res, next) => {
   }
 });
 
-// Reset a user's password (Super Admin action)
+
+// Reset a user's password (Super Admin action). If no password is given, a secure one is generated.
 router.put("/:id/password", async (req, res, next) => {
-  try {
-    const { password } = req.body;
-    if (!password || password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
-    const hashed = await bcrypt.hash(password, 10);
-    const user = await User.findByIdAndUpdate(req.params.id, { password: hashed }, { new: true }).select("-password");
-    if (!user) return res.status(404).json({ message: "User not found" });
-    res.json({ message: "Password updated" });
-  } catch (err) {
-    next(err);
-  }
-});
+    try {
+      let { password } = req.body;
+  
+      if (!password) {
+        // Generate a random, easy-to-read temporary password
+        const chars = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+        password = Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+      }
+      if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
+  
+      const hashed = await bcrypt.hash(password, 10);
+      const user = await User.findByIdAndUpdate(req.params.id, { password: hashed }, { new: true }).select("-password");
+      if (!user) return res.status(404).json({ message: "User not found" });
+  
+      // Return the plain password once so the Super Admin can share it with the user
+      res.json({ message: "Password updated", generatedPassword: password, user });
+    } catch (err) {
+      next(err);
+    }
+  });
 
 router.delete("/:id", async (req, res, next) => {
   try {

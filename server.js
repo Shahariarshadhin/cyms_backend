@@ -26,6 +26,8 @@ app.use("/api/dashboard", require("./routes/dashboard"));
 app.use("/api/reports", require("./routes/reports"));
 app.use("/api/upload", require("./routes/upload"));
 app.use("/api/excel", require("./routes/excel"));
+app.use("/api/settings", require("./routes/settings"));
+app.use("/api/boosting-cost", require("./routes/boostingCost"));
 
 app.use((err, req, res, next) => {
   console.error(err);

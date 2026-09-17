@@ -12,13 +12,8 @@ router.use(protect);
 
 router.get("/", async (req, res, next) => {
   try {
-    const { category, from, to, search, page = 1, limit = 50 } = req.query;
-    // Clamp the page size so a crafted request can't force one huge, slow fetch.
-    const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 500);
-    const safePage = Math.max(Number(page) || 1, 1);
-
-    // Rule 10 records are soft-deleted; never show them in the list or totals.
-    const q = { isDeleted: { $ne: true } };
+    const { category, search, from, to, page = 1, limit = 50 } = req.query;
+    const q = { isDeleted: false };
     if (category) q.category = category;
     if (from || to) {
       q.expenseDate = {};
@@ -26,50 +21,42 @@ router.get("/", async (req, res, next) => {
       if (to) q.expenseDate.$lte = new Date(to);
     }
     if (search) {
-      const re = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      q.$or = [{ description: re }, { expenseNumber: re }];
+      q.$or = [
+        { description: new RegExp(search, "i") },
+        { expenseNumber: new RegExp(search, "i") },
+      ];
     }
 
-    const [expenses, total] = await Promise.all([
-      Expense.find(q)
-        .sort({ expenseDate: -1 })
-        .skip((safePage - 1) * safeLimit)
-        .limit(safeLimit),
-      Expense.countDocuments(q),
-    ]);
+    const expenses = await Expense.find(q)
+      .sort({ expenseDate: -1 })
+      .skip((page - 1) * limit)
+      .limit(Number(limit));
+    const total = await Expense.countDocuments(q);
 
-    // Summary figures intentionally ignore category/search/pagination so the
-    // stat cards on the frontend always reflect the whole (non-deleted) dataset,
-    // not just whatever page or filter is currently active.
+    // Summary always reflects the whole dataset (not the current filter/page)
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
 
     const [overallAgg, monthAgg, overallCount] = await Promise.all([
       Expense.aggregate([
-        { $match: { isDeleted: { $ne: true } } },
-        { $group: { _id: null, sum: { $sum: "$amount" } } },
+        { $match: { isDeleted: false } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
       ]),
       Expense.aggregate([
-        {
-          $match: {
-            isDeleted: { $ne: true },
-            expenseDate: { $gte: monthStart, $lt: monthEnd },
-          },
-        },
-        { $group: { _id: null, sum: { $sum: "$amount" } } },
+        { $match: { isDeleted: false, expenseDate: { $gte: monthStart } } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
       ]),
-      Expense.countDocuments({ isDeleted: { $ne: true } }),
+      Expense.countDocuments({ isDeleted: false }),
     ]);
 
     res.json({
       expenses,
       total,
-      page: safePage,
-      pages: Math.max(1, Math.ceil(total / safeLimit)),
+      page: Number(page),
+      pages: Math.max(1, Math.ceil(total / limit)),
       summary: {
-        overallTotal: overallAgg[0]?.sum || 0,
-        thisMonthTotal: monthAgg[0]?.sum || 0,
+        overallTotal: overallAgg[0]?.total || 0,
+        thisMonthTotal: monthAgg[0]?.total || 0,
         overallCount,
       },
     });
@@ -106,13 +93,46 @@ router.post("/", async (req, res, next) => {
   }
 });
 
+// Edit an expense — every field, including category. Keeps the linked
+// ledger Transaction (created when the expense was first recorded) in sync
+// so the Finance balance and reports stay accurate.
 router.put("/:id", async (req, res, next) => {
   try {
-    const expense = await Expense.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-    });
-    if (!expense) return res.status(404).json({ message: "Expense not found" });
-    res.json(expense);
+    const existing = await Expense.findById(req.params.id);
+    if (!existing || existing.isDeleted)
+      return res.status(404).json({ message: "Expense not found" });
+
+    const allowed = [
+      "category",
+      "amount",
+      "expenseDate",
+      "description",
+      "paymentMethod",
+      "reference",
+      "attachment",
+    ];
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) existing[key] = req.body[key];
+    }
+    if (existing.amount < 0)
+      return res.status(400).json({ message: "Amount cannot be negative" });
+
+    await existing.save();
+
+    await Transaction.findOneAndUpdate(
+      { referenceType: "Expense", referenceId: existing._id },
+      {
+        transactionType:
+          existing.category === "PRODUCT_PURCHASE"
+            ? "PRODUCT_PURCHASE"
+            : "EXPENSE",
+        amount: existing.amount,
+        transactionDate: existing.expenseDate,
+        description: existing.description || `Expense: ${existing.category}`,
+      }
+    );
+
+    res.json(existing);
   } catch (err) {
     next(err);
   }
@@ -122,6 +142,10 @@ router.delete("/:id", async (req, res, next) => {
   try {
     // Rule 10: soft delete financial records
     await Expense.findByIdAndUpdate(req.params.id, { isDeleted: true });
+    await Transaction.findOneAndUpdate(
+      { referenceType: "Expense", referenceId: req.params.id },
+      { isDeleted: true }
+    );
     res.json({ message: "Expense removed" });
   } catch (err) {
     next(err);
