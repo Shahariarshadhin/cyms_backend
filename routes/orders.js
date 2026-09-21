@@ -79,6 +79,43 @@ function drawCard(doc, x, y, w, h, radius = 10) {
     .stroke();
 }
 
+// Draws a simple monoline social icon (facebook/instagram/youtube) in a
+// size x size box at (x, y), stroked/filled in `color`. Pure vector so it
+// needs no image asset or icon-font package.
+function drawSocialIcon(doc, type, x, y, size, color) {
+  const r = size / 2;
+  const cx = x + r;
+  const cy = y + r;
+  doc.lineWidth(1.2).strokeColor(color);
+  if (type === "facebook") {
+    doc.circle(cx, cy, r).stroke();
+    doc.font("Helvetica-Bold").fontSize(size * 0.6);
+    const tw = doc.widthOfString("f");
+    const th = doc.currentLineHeight();
+    doc
+      .fillColor(color)
+      .text("f", cx - tw / 2, cy - th / 2, { lineBreak: false });
+  } else if (type === "instagram") {
+    const rr = size * 0.28;
+    doc.roundedRect(x, y, size, size, rr).stroke();
+    doc.circle(cx, cy, size * 0.24).stroke();
+    doc.circle(x + size * 0.78, y + size * 0.22, size * 0.06).fill(color);
+  } else if (type === "youtube") {
+    const rr = size * 0.28;
+    doc.roundedRect(x, y, size, size, rr).stroke();
+    const tw = size * 0.34;
+    const th = size * 0.36;
+    const tx = cx - tw * 0.35;
+    const ty = cy - th / 2;
+    doc
+      .moveTo(tx, ty)
+      .lineTo(tx, ty + th)
+      .lineTo(tx + tw, ty + th / 2)
+      .closePath()
+      .fill(color);
+  }
+}
+
 router.get("/", async (req, res, next) => {
   try {
     const {
@@ -175,14 +212,6 @@ router.get("/:id/invoice", async (req, res, next) => {
     const CX = 40; // left/right content margin
     const CW = PAGE_W - CX * 2;
 
-    const STATUS_COLORS = {
-      PAID: { bg: "#dcfce7", text: "#166534", dot: "#16a34a" },
-      PARTIAL: { bg: "#fef3c7", text: "#92400e", dot: "#d97706" },
-      UNPAID: { bg: "#fee2e2", text: "#991b1b", dot: "#dc2626" },
-    };
-    const statusColor =
-      STATUS_COLORS[order.paymentStatus] || STATUS_COLORS.UNPAID;
-
     // Background watermark, drawn first so everything else sits on top.
     drawWatermark(doc);
 
@@ -256,7 +285,7 @@ router.get("/:id/invoice", async (req, res, next) => {
     ].filter(Boolean);
     const infoRowCount = 2 + (includeCoupon ? 1 : 0);
     const leftBlockH = 16 + 16 + billLines.length * 13;
-    const rightBlockH = infoRowCount * 15 + 24; // + status pill
+    const rightBlockH = infoRowCount * 15;
     const panelTop = 175;
     const panelH = Math.max(leftBlockH, rightBlockH) + 40;
 
@@ -301,18 +330,6 @@ router.get("/:id/invoice", async (req, res, next) => {
     if (includeCoupon) {
       infoRow("Coupon Code :", c.customerCode || "-");
     }
-    ry += 6;
-    const pillW = 76;
-    doc.roundedRect(RX + 220 - pillW, ry, pillW, 18, 9).fill(statusColor.bg);
-    doc
-      .fillColor(statusColor.text)
-      .font("Helvetica-Bold")
-      .fontSize(7.5)
-      .text(order.paymentStatus, RX + 220 - pillW, ry + 6, {
-        width: pillW,
-        align: "center",
-        characterSpacing: 0.5,
-      });
 
     y = panelTop + panelH + 25;
 
@@ -333,7 +350,7 @@ router.get("/:id/invoice", async (req, res, next) => {
     doc.text("PRICE", cols.price, y + 10, { width: 60, align: "right" });
     doc.text("QTY", cols.qty, y + 10, { width: 30, align: "right" });
     doc.text("TOTAL", cols.total, y + 10, {
-      width: CX + CW - cols.total,
+      width: CX + CW - cols.total - 12,
       align: "right",
     });
     y += 28;
@@ -374,7 +391,7 @@ router.get("/:id/invoice", async (req, res, next) => {
       });
       doc.text(String(qty), cols.qty, y + 10, { width: 30, align: "right" });
       doc.text(money(unitPrice * qty), cols.total, y + 10, {
-        width: CX + CW - cols.total,
+        width: CX + CW - cols.total - 12,
         align: "right",
       });
       doc
@@ -427,28 +444,6 @@ router.get("/:id/invoice", async (req, res, next) => {
       align: "right",
     });
 
-    let py = barY + 34 + 14;
-    const paidDueRow = (label, value, dotColor) => {
-      doc.circle(labelX + 3, py + 5, 3).fill(dotColor);
-      doc
-        .font("Helvetica")
-        .fontSize(9)
-        .fillColor(MUTED)
-        .text(label, labelX + 14, py);
-      doc
-        .font("Helvetica-Bold")
-        .fontSize(9)
-        .fillColor(INK)
-        .text(value, labelX, py, { width: valueW, align: "right" });
-      py += 16;
-    };
-    paidDueRow("Paid", money(order.paidAmount), "#16a34a");
-    paidDueRow(
-      "Due",
-      money(order.dueAmount),
-      order.dueAmount > 0 ? "#dc2626" : "#16a34a"
-    );
-
     // ---- Footer: diagonal brand banner with circle accents + accent strip ----
     doc
       .font("Helvetica-Oblique")
@@ -458,7 +453,7 @@ router.get("/:id/invoice", async (req, res, next) => {
         width: CW - 260,
       });
 
-    const footerH = 140;
+    const footerH = 155;
     const footPts = [
       [PAGE_W, PAGE_H],
       [PAGE_W - 350, PAGE_H],
@@ -471,8 +466,8 @@ router.get("/:id/invoice", async (req, res, next) => {
     doc.save();
     doc.polygon(...footPts).clip();
     withAlpha(doc, 0.08, () => {
-      doc.circle(PAGE_W - 60, PAGE_H - 120, 60).fill("#ffffff");
-      doc.circle(PAGE_W - 300, PAGE_H - 20, 40).fill("#ffffff");
+      doc.circle(PAGE_W - 60, PAGE_H - 130, 60).fill("#ffffff");
+      doc.circle(PAGE_W - 300, PAGE_H - 25, 40).fill("#ffffff");
     });
     doc.restore();
 
@@ -489,6 +484,17 @@ router.get("/:id/invoice", async (req, res, next) => {
     ["01798982335", "01309083807", "cozyyards.com"].forEach((line) => {
       doc.text(line, PAGE_W - 260, fy, { width: 220, align: "right" });
       fy += 16;
+    });
+
+    // ---- Social icons, right-aligned under the contact lines ----
+    const iconSize = 18;
+    const iconGap = 12;
+    const iconsW = iconSize * 3 + iconGap * 2;
+    let iconX = PAGE_W - 40 - iconsW;
+    const iconY = fy + 6;
+    ["facebook", "instagram", "youtube"].forEach((type) => {
+      drawSocialIcon(doc, type, iconX, iconY, iconSize, "#ffffff");
+      iconX += iconSize + iconGap;
     });
 
     doc.rect(0, PAGE_H - 8, PAGE_W, 8).fill(BRAND_DARK);
