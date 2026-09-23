@@ -195,7 +195,7 @@ router.get("/:id/invoice", async (req, res, next) => {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="invoice-${order.orderNumber}.pdf"`
+      `attachment; filename="invoice-${order.orderNumber}.pdf"`,
     );
 
     const doc = new PDFDocument({ size: "A4", margin: 0 });
@@ -325,7 +325,7 @@ router.get("/:id/invoice", async (req, res, next) => {
     infoRow("Invoice No :", order.orderNumber);
     infoRow(
       "Date :",
-      new Date(order.orderDate || order.createdAt).toLocaleDateString()
+      new Date(order.orderDate || order.createdAt).toLocaleDateString(),
     );
     if (includeCoupon) {
       infoRow("Coupon Code :", c.customerCode || "-");
@@ -514,6 +514,7 @@ router.post("/", async (req, res, next) => {
       discount = 0,
       deliveryCharge = 0,
       notes = "",
+      orderDate,
     } = req.body;
     if (!customer || !items || !items.length) {
       return res
@@ -597,13 +598,14 @@ router.post("/", async (req, res, next) => {
       status: "PENDING",
       deliveryStatus: "PENDING",
       notes,
+      orderDate: orderDate || Date.now(),
       createdBy: req.user._id,
     });
 
     // link inventory items to this order
     await InventoryItem.updateMany(
       { _id: { $in: orderItems.map((o) => o.inventoryItem) } },
-      { $set: { order: order._id } }
+      { $set: { order: order._id } },
     );
 
     await Delivery.create({
@@ -633,7 +635,7 @@ router.put("/:id", async (req, res, next) => {
     order.dueAmount = order.totalAmount - order.paidAmount;
     order.paymentStatus = computePaymentStatus(
       order.totalAmount,
-      order.paidAmount
+      order.paidAmount,
     );
 
     if (status) {
@@ -643,7 +645,7 @@ router.put("/:id", async (req, res, next) => {
         const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
         await InventoryItem.updateMany(
           { _id: { $in: invIds }, status: { $ne: "SOLD" } },
-          { $set: { status: "IN_STOCK", order: null } }
+          { $set: { status: "IN_STOCK", order: null } },
         );
         for (const it of order.items) {
           const count = await InventoryItem.countDocuments({
@@ -661,12 +663,12 @@ router.put("/:id", async (req, res, next) => {
         const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
         await InventoryItem.updateMany(
           { _id: { $in: invIds } },
-          { $set: { status: "SOLD", soldDate: new Date() } }
+          { $set: { status: "SOLD", soldDate: new Date() } },
         );
         order.deliveryStatus = "DELIVERED";
         await Delivery.findOneAndUpdate(
           { order: order._id },
-          { status: "DELIVERED", deliveredDate: new Date() }
+          { status: "DELIVERED", deliveredDate: new Date() },
         );
       }
     }
@@ -689,7 +691,7 @@ router.delete("/:id", async (req, res, next) => {
     const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
     await InventoryItem.updateMany(
       { _id: { $in: invIds }, status: { $ne: "SOLD" } },
-      { $set: { status: "IN_STOCK", order: null } }
+      { $set: { status: "IN_STOCK", order: null } },
     );
     for (const it of order.items) {
       const count = await InventoryItem.countDocuments({

@@ -12,7 +12,9 @@ router.get("/", async (req, res, next) => {
     if (status) q.status = status;
     if (search) q.productName = new RegExp(search, "i");
 
-    const items = await ResearchProduct.find(q).sort({ createdAt: -1 });
+    const items = await ResearchProduct.find(q)
+      .populate("createdBy", "name")
+      .sort({ createdAt: -1 });
     res.json({ items });
   } catch (err) {
     next(err);
@@ -21,10 +23,19 @@ router.get("/", async (req, res, next) => {
 
 router.post("/", async (req, res, next) => {
   try {
-    const { productName, image, imagePublicId, marketPriceMin, marketPriceMax, sourceLink, notes } = req.body;
-    if (!productName) return res.status(400).json({ message: "Product name is required" });
+    const {
+      productName,
+      image,
+      imagePublicId,
+      marketPriceMin,
+      marketPriceMax,
+      sourceLink,
+      notes,
+    } = req.body;
+    if (!productName)
+      return res.status(400).json({ message: "Product name is required" });
 
-    const item = await ResearchProduct.create({
+    let item = await ResearchProduct.create({
       productName,
       image: image || "",
       imagePublicId: imagePublicId || "",
@@ -34,6 +45,7 @@ router.post("/", async (req, res, next) => {
       notes: notes || "",
       createdBy: req.user._id,
     });
+    item = await item.populate("createdBy", "name");
     res.status(201).json(item);
   } catch (err) {
     next(err);
@@ -42,12 +54,24 @@ router.post("/", async (req, res, next) => {
 
 router.put("/:id", async (req, res, next) => {
   try {
-    const allowed = ["productName", "image", "imagePublicId", "marketPriceMin", "marketPriceMax", "sourceLink", "notes"];
+    const allowed = [
+      "productName",
+      "image",
+      "imagePublicId",
+      "marketPriceMin",
+      "marketPriceMax",
+      "sourceLink",
+      "notes",
+    ];
     const update = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) update[key] = req.body[key];
     }
-    const item = await ResearchProduct.findByIdAndUpdate(req.params.id, update, { new: true });
+    const item = await ResearchProduct.findByIdAndUpdate(
+      req.params.id,
+      update,
+      { new: true },
+    ).populate("createdBy", "name");
     if (!item) return res.status(404).json({ message: "Item not found" });
     res.json(item);
   } catch (err) {
@@ -63,9 +87,13 @@ router.post("/:id/purchase", async (req, res, next) => {
     if (!item) return res.status(404).json({ message: "Item not found" });
 
     item.status = "PURCHASED";
-    item.purchasedPrice = purchasedPrice !== undefined && purchasedPrice !== "" ? Number(purchasedPrice) : null;
+    item.purchasedPrice =
+      purchasedPrice !== undefined && purchasedPrice !== ""
+        ? Number(purchasedPrice)
+        : null;
     item.purchasedDate = purchasedDate || new Date();
     await item.save();
+    await item.populate("createdBy", "name");
 
     res.json(item);
   } catch (err) {
@@ -79,8 +107,8 @@ router.post("/:id/revert", async (req, res, next) => {
     const item = await ResearchProduct.findByIdAndUpdate(
       req.params.id,
       { status: "RESEARCHING", purchasedPrice: null, purchasedDate: null },
-      { new: true }
-    );
+      { new: true },
+    ).populate("createdBy", "name");
     if (!item) return res.status(404).json({ message: "Item not found" });
     res.json(item);
   } catch (err) {
