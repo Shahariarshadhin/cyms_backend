@@ -61,10 +61,15 @@ router.post("/", async (req, res, next) => {
     if (!product) return res.status(404).json({ message: "Product not found" });
 
     const created = [];
+    let resolvedPurchasePrice, resolvedAdditionalCost;
+
     for (let i = 0; i < Number(quantity); i++) {
       const inventoryCode = await generateInventoryCode();
       const pPrice = purchasePrice ?? product.purchasePrice;
       const aCost = additionalCost ?? product.additionalCost;
+      resolvedPurchasePrice = pPrice;   // same value every loop iteration — just
+      resolvedAdditionalCost = aCost;   // capturing it once for use after the loop
+
       const item = await InventoryItem.create({
         inventoryCode,
         product: product._id,
@@ -85,6 +90,17 @@ router.post("/", async (req, res, next) => {
       });
       created.push(item);
     }
+
+    // --- ADD THIS ---
+    // Keep Product's default cost in sync with the MOST RECENT restock,
+    // so the restock form's "Default: $X" placeholder always shows the
+    // latest price, not a stale original value.
+    await Product.findByIdAndUpdate(product._id, {
+      purchasePrice: resolvedPurchasePrice,
+      additionalCost: resolvedAdditionalCost,
+    });
+    // --- END ADD ---
+
     await syncProductQuantity(product._id);
     res.status(201).json(created);
   } catch (err) {
@@ -220,6 +236,68 @@ router.get("/movements/:productId", async (req, res, next) => {
       product: req.params.productId,
     }).sort({ createdAt: -1 });
     res.json(movements);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/inventory/history/:productId
+// Full purchase-cost history for a product: every restock batch, oldest -> newest,
+// with how many units from that batch are still IN_STOCK vs already sold/removed.
+router.get("/history/:productId", protect, async (req, res, next) => {
+  try {
+    const { productId } = req.params;
+
+    const items = await InventoryItem.find({ product: productId })
+      .sort({ purchaseDate: 1, createdAt: 1 })
+      .select(
+        "inventoryCode purchasePrice additionalCost totalCost purchaseDate supplier status"
+      );
+
+    if (!items.length) {
+      return res.json({ product: productId, batches: [], latest: null });
+    }
+
+    // Group items that share the exact same price+date combo into one "batch" row,
+    // since a single restock call creates several identical InventoryItems at once.
+    const batchMap = new Map();
+    for (const it of items) {
+      const key = `${it.purchasePrice}_${it.additionalCost}_${new Date(
+        it.purchaseDate
+      ).toISOString()}`;
+      if (!batchMap.has(key)) {
+        batchMap.set(key, {
+          purchasePrice: it.purchasePrice,
+          additionalCost: it.additionalCost,
+          totalCost: it.totalCost,
+          purchaseDate: it.purchaseDate,
+          supplier: it.supplier,
+          quantityBought: 0,
+          quantityInStock: 0,
+          quantitySold: 0,
+          quantityOther: 0, // damaged/lost/returned/cancelled
+        });
+      }
+      const b = batchMap.get(key);
+      b.quantityBought += 1;
+      if (it.status === "IN_STOCK") b.quantityInStock += 1;
+      else if (it.status === "SOLD") b.quantitySold += 1;
+      else b.quantityOther += 1;
+    }
+
+    const batches = Array.from(batchMap.values()).sort(
+      (a, b) => new Date(a.purchaseDate) - new Date(b.purchaseDate)
+    );
+
+    const latest = batches[batches.length - 1];
+    const previous = batches.length > 1 ? batches[batches.length - 2] : null;
+
+    res.json({
+      product: productId,
+      batches,       // full chronological list, oldest first
+      latest,        // most recent restock batch
+      previous,       // the one before it, if any
+    });
   } catch (err) {
     next(err);
   }

@@ -505,7 +505,8 @@ router.get("/:id/invoice", async (req, res, next) => {
   }
 });
 
-// Create order: reserves inventory items (Rule 1, 2, 4)
+// backend/routes/orders.js — POST "/" (create order) — REPLACE the item-building loop with this
+
 router.post("/", async (req, res, next) => {
   try {
     const {
@@ -514,7 +515,6 @@ router.post("/", async (req, res, next) => {
       discount = 0,
       deliveryCharge = 0,
       notes = "",
-      orderDate,
     } = req.body;
     if (!customer || !items || !items.length) {
       return res
@@ -526,19 +526,23 @@ router.post("/", async (req, res, next) => {
     let subtotal = 0;
 
     for (const it of items) {
-      if (it.quantity < 1)
+      if (it.quantity < 1) {
         return res.status(400).json({ message: "Quantity must be at least 1" });
+      }
       const product = await Product.findById(it.product);
-      if (!product)
+      if (!product) {
         return res
           .status(404)
           .json({ message: `Product not found: ${it.product}` });
+      }
 
-      // Reserve available IN_STOCK inventory items for this product
       const available = await InventoryItem.find({
         product: product._id,
         status: "IN_STOCK",
-      }).limit(it.quantity);
+      })
+        .sort({ purchaseDate: 1, createdAt: 1 }) // FIFO — same order inventory/decrease uses
+        .limit(it.quantity);
+
       if (available.length < it.quantity) {
         return res.status(400).json({
           message: `Insufficient stock for ${product.watchName}. Available: ${available.length}, requested: ${it.quantity}`,
@@ -547,20 +551,29 @@ router.post("/", async (req, res, next) => {
 
       const unitPrice =
         it.unitPrice ?? product.estSellingMin ?? product.purchasePrice;
-      const costPrice = product.purchasePrice;
-      const additionalCost = product.additionalCost;
-      const profitEach = unitPrice - costPrice - additionalCost;
 
       for (const invItem of available) {
+        // Cost comes from THIS unit's own recorded purchase — the batch it
+        // was actually restocked at — not the product's current default.
+        // That's what lets two units of the same product carry different
+        // real costs and still produce correct per-sale profit.
+        const costPrice = invItem.purchasePrice;
+        const additionalCost = invItem.additionalCost;
+        const profitEach = unitPrice - costPrice - additionalCost;
+
         invItem.status = "RESERVED";
+        invItem.order = null; // set to the real order id after order is created, below
         await invItem.save();
+
         await InventoryMovement.create({
           inventoryItem: invItem._id,
           product: product._id,
           type: "SALE",
           quantity: -1,
+          referenceType: "Order",
           notes: "Reserved for order",
         });
+
         orderItems.push({
           product: product._id,
           inventoryItem: invItem._id,
@@ -572,6 +585,7 @@ router.post("/", async (req, res, next) => {
           profit: profitEach,
         });
       }
+
       subtotal += unitPrice * it.quantity;
 
       const count = await InventoryItem.countDocuments({
@@ -581,46 +595,34 @@ router.post("/", async (req, res, next) => {
       await Product.findByIdAndUpdate(product._id, { quantity: count });
     }
 
-    const totalAmount = subtotal - Number(discount) + Number(deliveryCharge);
-    const orderNumber = await generateOrderNumber();
+    const total = subtotal - discount + deliveryCharge;
 
     const order = await Order.create({
-      orderNumber,
       customer,
       items: orderItems,
       subtotal,
       discount,
       deliveryCharge,
-      totalAmount,
-      paidAmount: 0,
-      dueAmount: totalAmount,
-      paymentStatus: "UNPAID",
-      status: "PENDING",
-      deliveryStatus: "PENDING",
+      total,
       notes,
-      orderDate: orderDate || Date.now(),
       createdBy: req.user._id,
     });
 
-    // link inventory items to this order
+    // Now that we have the real order id, stamp it onto the reserved items
     await InventoryItem.updateMany(
-      { _id: { $in: orderItems.map((o) => o.inventoryItem) } },
+      { _id: { $in: orderItems.map((oi) => oi.inventoryItem) } },
       { $set: { order: order._id } },
     );
 
-    await Delivery.create({
-      order: order._id,
-      customer,
-      deliveryCharge,
-      status: "PENDING",
-    });
+    const populated = await Order.findById(order._id)
+      .populate("customer")
+      .populate("items.product");
 
-    res.status(201).json(order);
+    res.status(201).json(populated);
   } catch (err) {
     next(err);
   }
 });
-
 router.put("/:id", async (req, res, next) => {
   try {
     const order = await Order.findById(req.params.id);
