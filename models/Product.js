@@ -7,6 +7,7 @@ const productSchema = new mongoose.Schema(
     watchName: { type: String, required: true },
     brand: { type: String, default: "" },
     category: { type: String, default: "General" },
+    gender: { type: String, enum: ["MEN", "LADIES"], default: "MEN" },
     description: { type: String, default: "" },
     image: { type: String, default: "" }, // cloudinary URL
     imagePublicId: { type: String, default: "" },
@@ -17,8 +18,10 @@ const productSchema = new mongoose.Schema(
     quantity: { type: Number, default: 0 }, // derived cache, kept in sync
     minimumStock: { type: Number, default: 2 },
     isActive: { type: Boolean, default: true },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
 productSchema.virtual("totalCost").get(function () {

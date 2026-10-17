@@ -11,6 +11,7 @@ const userSchema = new mongoose.Schema(
       default: "SALES",
     },
     isActive: { type: Boolean, default: true },
+    lastLoginAt: { type: Date },
   },
   { timestamps: true }
 );

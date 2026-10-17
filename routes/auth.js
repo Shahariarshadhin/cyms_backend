@@ -48,14 +48,37 @@ router.post("/register", async (req, res, next) => {
   }
 });
 
+const { logAudit } = require("../utils/audit");
+
 router.post("/login", async (req, res, next) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email: (email || "").toLowerCase() });
-    if (!user) return res.status(401).json({ message: "Invalid credentials" });
+    const normalized = (email || "").toLowerCase();
+    const user = await User.findOne({ email: normalized });
+
+    if (!user) {
+      await logAudit(req, {
+        action: "LOGIN_FAILED",
+        entity: "AUTH",
+        userEmail: normalized,
+        note: "Unknown email",
+      });
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
 
     const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(401).json({ message: "Invalid credentials" });
+    if (!match) {
+      await logAudit(req, {
+        user,
+        action: "LOGIN_FAILED",
+        entity: "AUTH",
+        note: "Wrong password",
+      });
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    await User.updateOne({ _id: user._id }, { lastLoginAt: new Date() });
+    await logAudit(req, { user, action: "LOGIN", entity: "AUTH" });
 
     res.json({
       user: {

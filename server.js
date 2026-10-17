@@ -60,6 +60,7 @@ app.use("/api/excel", require("./routes/excel"));
 app.use("/api/settings", require("./routes/settings"));
 app.use("/api/boosting-cost", require("./routes/boostingCost"));
 app.use("/api/research-products", require("./routes/researchProducts"));
+app.use("/api/audit", require("./routes/audit"));
 
 // Error handler
 app.use((err, req, res, next) => {
