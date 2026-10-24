@@ -164,4 +164,98 @@ router.get("/delivery", async (req, res, next) => {
   }
 });
 
+// Per-product profit, delivered orders only
+router.get("/product-profit", async (req, res, next) => {
+  try {
+    const { range = "this_month", from, to } = req.query;
+    const { start, end } = dateRange(range, from, to);
+
+    const products = await Order.aggregate([
+      {
+        $match: {
+          status: "DELIVERED",
+          orderDate: { $gte: start, $lte: end },
+        },
+      },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id: "$items.product",
+          productName: { $last: "$items.productName" },
+          unitsSold: { $sum: "$items.quantity" },
+          purchaseCost: {
+            $sum: { $multiply: ["$items.costPrice", "$items.quantity"] },
+          },
+          otherCost: {
+            $sum: { $multiply: ["$items.additionalCost", "$items.quantity"] },
+          },
+          sellingTotal: {
+            $sum: { $multiply: ["$items.unitPrice", "$items.quantity"] },
+          },
+        },
+      },
+      {
+        $addFields: {
+          profit: {
+            $subtract: [
+              "$sellingTotal",
+              { $add: ["$purchaseCost", "$otherCost"] },
+            ],
+          },
+        },
+      },
+      { $sort: { profit: -1 } },
+    ]);
+
+    const totals = products.reduce(
+      (t, p) => ({
+        unitsSold: t.unitsSold + p.unitsSold,
+        purchaseCost: t.purchaseCost + p.purchaseCost,
+        otherCost: t.otherCost + p.otherCost,
+        sellingTotal: t.sellingTotal + p.sellingTotal,
+        profit: t.profit + p.profit,
+      }),
+      { unitsSold: 0, purchaseCost: 0, otherCost: 0, sellingTotal: 0, profit: 0 },
+    );
+
+    res.json({ products, totals });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Every individual delivered sale of one product (for the expandable rows)
+router.get("/product-profit/:productId", async (req, res, next) => {
+  try {
+    const { range = "this_month", from, to } = req.query;
+    const { start, end } = dateRange(range, from, to);
+
+    const orders = await Order.find({
+      status: "DELIVERED",
+      orderDate: { $gte: start, $lte: end },
+      "items.product": req.params.productId,
+    }).sort({ orderDate: -1 });
+
+    const sales = [];
+    for (const o of orders) {
+      for (const it of o.items) {
+        if (String(it.product) !== req.params.productId) continue;
+        const qty = it.quantity || 1;
+        sales.push({
+          orderNumber: o.orderNumber,
+          date: o.orderDate,
+          purchasePrice: it.costPrice,
+          otherCost: it.additionalCost,
+          sellingPrice: it.unitPrice,
+          quantity: qty,
+          profit: (it.unitPrice - it.costPrice - it.additionalCost) * qty,
+        });
+      }
+    }
+    res.json(sales);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

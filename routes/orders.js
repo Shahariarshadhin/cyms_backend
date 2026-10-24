@@ -28,6 +28,44 @@ function money(n) {
   })}`;
 }
 
+async function releaseOrderStock(order, note) {
+  const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
+  if (!invIds.length) return;
+
+  const units = await InventoryItem.find({
+    _id: { $in: invIds },
+    order: order._id,
+    status: { $in: ["RESERVED", "SOLD"] },
+  });
+  if (!units.length) return;
+
+  await InventoryItem.updateMany(
+    { _id: { $in: units.map((u) => u._id) } },
+    { $set: { status: "IN_STOCK", order: null, soldDate: null } },
+  );
+
+  await InventoryMovement.insertMany(
+    units.map((u) => ({
+      inventoryItem: u._id,
+      product: u.product,
+      type: "RETURN",
+      quantity: 1,
+      referenceType: "Order",
+      referenceId: order._id,
+      notes: note,
+    })),
+  );
+
+  const productIds = [...new Set(units.map((u) => String(u.product)))];
+  for (const pid of productIds) {
+    const count = await InventoryItem.countDocuments({
+      product: pid,
+      status: "IN_STOCK",
+    });
+    await Product.findByIdAndUpdate(pid, { quantity: count });
+  }
+}
+
 // Draws the company logo, faint and centered, behind everything else on the
 // current page. Call this right after creating the doc and again after every
 // doc.addPage() so multi-page invoices stay watermarked throughout.
@@ -508,14 +546,41 @@ router.get("/:id/invoice", async (req, res, next) => {
 // backend/routes/orders.js — POST "/" (create order) — REPLACE the item-building loop with this
 
 router.post("/", async (req, res, next) => {
+  // Track everything reserved during this request so we can undo it
+  // if anything fails before the order is saved.
+  const reservedIds = [];
+  const movementIds = [];
+  const touchedProducts = new Set();
+
+  const releaseReserved = async () => {
+    if (reservedIds.length) {
+      await InventoryItem.updateMany(
+        { _id: { $in: reservedIds }, status: "RESERVED" },
+        { $set: { status: "IN_STOCK", order: null } },
+      );
+    }
+    if (movementIds.length) {
+      await InventoryMovement.deleteMany({ _id: { $in: movementIds } });
+    }
+    for (const pid of touchedProducts) {
+      const count = await InventoryItem.countDocuments({
+        product: pid,
+        status: "IN_STOCK",
+      });
+      await Product.findByIdAndUpdate(pid, { quantity: count });
+    }
+  };
+
   try {
     const {
       customer,
       items,
+      orderDate,
       discount = 0,
       deliveryCharge = 0,
       notes = "",
     } = req.body;
+
     if (!customer || !items || !items.length) {
       return res
         .status(400)
@@ -527,10 +592,12 @@ router.post("/", async (req, res, next) => {
 
     for (const it of items) {
       if (it.quantity < 1) {
+        await releaseReserved();
         return res.status(400).json({ message: "Quantity must be at least 1" });
       }
       const product = await Product.findById(it.product);
       if (!product) {
+        await releaseReserved();
         return res
           .status(404)
           .json({ message: `Product not found: ${it.product}` });
@@ -540,10 +607,11 @@ router.post("/", async (req, res, next) => {
         product: product._id,
         status: "IN_STOCK",
       })
-        .sort({ purchaseDate: 1, createdAt: 1 }) // FIFO — same order inventory/decrease uses
+        .sort({ purchaseDate: 1, createdAt: 1 }) // FIFO
         .limit(it.quantity);
 
       if (available.length < it.quantity) {
+        await releaseReserved();
         return res.status(400).json({
           message: `Insufficient stock for ${product.watchName}. Available: ${available.length}, requested: ${it.quantity}`,
         });
@@ -553,19 +621,17 @@ router.post("/", async (req, res, next) => {
         it.unitPrice ?? product.estSellingMin ?? product.purchasePrice;
 
       for (const invItem of available) {
-        // Cost comes from THIS unit's own recorded purchase — the batch it
-        // was actually restocked at — not the product's current default.
-        // That's what lets two units of the same product carry different
-        // real costs and still produce correct per-sale profit.
         const costPrice = invItem.purchasePrice;
         const additionalCost = invItem.additionalCost;
         const profitEach = unitPrice - costPrice - additionalCost;
 
         invItem.status = "RESERVED";
-        invItem.order = null; // set to the real order id after order is created, below
+        invItem.order = null; // stamped with the real order id below
         await invItem.save();
+        reservedIds.push(invItem._id);
+        touchedProducts.add(String(product._id));
 
-        await InventoryMovement.create({
+        const movement = await InventoryMovement.create({
           inventoryItem: invItem._id,
           product: product._id,
           type: "SALE",
@@ -573,6 +639,7 @@ router.post("/", async (req, res, next) => {
           referenceType: "Order",
           notes: "Reserved for order",
         });
+        movementIds.push(movement._id);
 
         orderItems.push({
           product: product._id,
@@ -595,15 +662,19 @@ router.post("/", async (req, res, next) => {
       await Product.findByIdAndUpdate(product._id, { quantity: count });
     }
 
-    const total = subtotal - discount + deliveryCharge;
+    const totalAmount = subtotal - discount + deliveryCharge;
 
     const order = await Order.create({
+      orderNumber: await generateOrderNumber(), // the actual fix
       customer,
+      orderDate: orderDate || undefined, // falls back to Date.now
       items: orderItems,
       subtotal,
       discount,
       deliveryCharge,
-      total,
+      totalAmount, // was `total`, which the schema ignored
+      dueAmount: totalAmount,
+      paymentStatus: "UNPAID",
       notes,
       createdBy: req.user._id,
     });
@@ -620,9 +691,16 @@ router.post("/", async (req, res, next) => {
 
     res.status(201).json(populated);
   } catch (err) {
+    // Anything failed after reserving stock: put it back, then report.
+    try {
+      await releaseReserved();
+    } catch (releaseErr) {
+      console.error("Failed to release reserved stock:", releaseErr);
+    }
     next(err);
   }
 });
+
 router.put("/:id", async (req, res, next) => {
   try {
     const order = await Order.findById(req.params.id);
@@ -640,27 +718,16 @@ router.put("/:id", async (req, res, next) => {
       order.paidAmount,
     );
 
+    const previousStatus = order.status; // remember the old status
+
     if (status) {
       order.status = status;
-      // Rule 6: cancelled orders release reserved inventory back to stock
-      if (status === "CANCELLED") {
-        const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
-        await InventoryItem.updateMany(
-          { _id: { $in: invIds }, status: { $ne: "SOLD" } },
-          { $set: { status: "IN_STOCK", order: null } },
-        );
-        for (const it of order.items) {
-          const count = await InventoryItem.countDocuments({
-            product: it.product,
-            status: "IN_STOCK",
-          });
-          await Product.findByIdAndUpdate(it.product, { quantity: count });
-        }
-        // A cancelled order shouldn't keep contributing an outstanding "due"
-        // amount to revenue/due reporting elsewhere — there's nothing left to
-        // collect on it. Paid/total amounts are kept as-is for the record.
+
+      if (status === "CANCELLED" && previousStatus !== "CANCELLED") {
+        await releaseOrderStock(order, "Order cancelled - stock restored");
         order.dueAmount = 0;
       }
+
       if (status === "DELIVERED") {
         const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
         await InventoryItem.updateMany(
@@ -690,18 +757,7 @@ router.delete("/:id", async (req, res, next) => {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: "Order not found" });
 
-    const invIds = order.items.map((i) => i.inventoryItem).filter(Boolean);
-    await InventoryItem.updateMany(
-      { _id: { $in: invIds }, status: { $ne: "SOLD" } },
-      { $set: { status: "IN_STOCK", order: null } },
-    );
-    for (const it of order.items) {
-      const count = await InventoryItem.countDocuments({
-        product: it.product,
-        status: "IN_STOCK",
-      });
-      await Product.findByIdAndUpdate(it.product, { quantity: count });
-    }
+    await releaseOrderStock(order, "Order deleted - stock restored");
 
     await Delivery.deleteOne({ order: order._id });
     await Order.findByIdAndDelete(req.params.id);
