@@ -5,9 +5,19 @@ const Order = require("../models/Order");
 const Expense = require("../models/Expense");
 const Transaction = require("../models/Transaction");
 const { protect } = require("../middleware/auth");
+const ProfitAdjustment = require("../models/ProfitAdjustment");
 
 const router = express.Router();
 router.use(protect);
+
+function adjustmentPipeline() {
+  return [
+    { $match: { isDeleted: false } },
+    { $lookup: { from: "orders", localField: "order", foreignField: "_id", as: "o" } },
+    { $unwind: "$o" },
+    { $match: { "o.status": { $ne: "CANCELLED" } } },
+  ];
+}
 
 router.get("/summary", async (req, res, next) => {
   try {
@@ -17,10 +27,16 @@ router.get("/summary", async (req, res, next) => {
 
     const orders = await Order.find({ status: { $ne: "CANCELLED" } });
     const totalSales = orders.reduce((s, o) => s + (o.totalAmount || 0), 0);
-    const totalProfit = orders.reduce(
+    const baseProfit = orders.reduce(
       (s, o) => s + o.items.reduce((si, it) => si + (it.profit || 0) * (it.quantity || 1), 0),
       0
     );
+    const adjAgg = await ProfitAdjustment.aggregate([
+      ...adjustmentPipeline(),
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+    const profitAdjustment = adjAgg[0]?.total || 0;
+    const totalProfit = baseProfit + profitAdjustment;
 
     const expenseAgg = await Expense.aggregate([
       { $match: { isDeleted: false } },
@@ -48,6 +64,7 @@ router.get("/summary", async (req, res, next) => {
       sold,
       totalSales,
       totalProfit,
+      profitAdjustment,
       totalExpense,
       currentBalance,
       pendingOrders,
@@ -82,7 +99,26 @@ router.get("/sales-chart", async (req, res, next) => {
       { $sort: { _id: 1 } },
       { $limit: 24 },
     ]);
-    res.json(data.map((d) => ({ period: d._id, sales: d.sales, profit: d.profit })));
+
+    // Put each adjustment in the same period bucket as the order it corrects
+    const adjData = await ProfitAdjustment.aggregate([
+      ...adjustmentPipeline(),
+      {
+        $group: {
+          _id: { $dateToString: { format: groupFormat, date: "$o.orderDate" } },
+          adjustment: { $sum: "$amount" },
+        },
+      },
+    ]);
+    const adjMap = new Map(adjData.map((a) => [a._id, a.adjustment]));
+
+    res.json(
+      data.map((d) => ({
+        period: d._id,
+        sales: d.sales,
+        profit: d.profit + (adjMap.get(d._id) || 0),
+      }))
+    );
   } catch (err) {
     next(err);
   }

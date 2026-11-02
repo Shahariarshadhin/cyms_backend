@@ -6,6 +6,7 @@ const Expense = require("../models/Expense");
 const Customer = require("../models/Customer");
 const Delivery = require("../models/Delivery");
 const { protect } = require("../middleware/auth");
+const ProfitAdjustment = require("../models/ProfitAdjustment");
 
 const router = express.Router();
 router.use(protect);
@@ -49,6 +50,14 @@ function dateRange(range, from, to) {
   }
   return { start, end };
 }
+function adjustmentPipeline(start, end, statusMatch) {
+  return [
+    { $match: { isDeleted: false, orderDate: { $gte: start, $lte: end } } },
+    { $lookup: { from: "orders", localField: "order", foreignField: "_id", as: "o" } },
+    { $unwind: "$o" },
+    { $match: { "o.status": statusMatch } },
+  ];
+}
 
 router.get("/sales", async (req, res, next) => {
   try {
@@ -83,7 +92,14 @@ router.get("/profit", async (req, res, next) => {
       (s, o) => s + o.items.reduce((si, it) => si + it.additionalCost * it.quantity, 0),
       0
     );
-    const grossProfit = sales - productCost - additionalCost;
+
+    const adjAgg = await ProfitAdjustment.aggregate([
+      ...adjustmentPipeline(start, end, { $ne: "CANCELLED" }),
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+    const profitAdjustment = adjAgg[0]?.total || 0;
+
+    const grossProfit = sales - productCost - additionalCost + profitAdjustment;
 
     const expenses = await Expense.aggregate([
       { $match: { isDeleted: false, expenseDate: { $gte: start, $lte: end } } },
@@ -92,12 +108,11 @@ router.get("/profit", async (req, res, next) => {
     const otherExpense = expenses[0]?.total || 0;
     const netProfit = grossProfit - otherExpense;
 
-    res.json({ sales, productCost, additionalCost, grossProfit, otherExpense, netProfit });
+    res.json({ sales, productCost, additionalCost, profitAdjustment, grossProfit, otherExpense, netProfit });
   } catch (err) {
     next(err);
   }
 });
-
 router.get("/inventory", async (req, res, next) => {
   try {
     const current = await InventoryItem.find({ status: "IN_STOCK" }).populate("product", "modelName watchName sku");
@@ -164,48 +179,38 @@ router.get("/delivery", async (req, res, next) => {
   }
 });
 
-// Per-product profit, delivered orders only
 router.get("/product-profit", async (req, res, next) => {
   try {
     const { range = "this_month", from, to } = req.query;
     const { start, end } = dateRange(range, from, to);
 
     const products = await Order.aggregate([
-      {
-        $match: {
-          status: "DELIVERED",
-          orderDate: { $gte: start, $lte: end },
-        },
-      },
+      { $match: { status: "DELIVERED", orderDate: { $gte: start, $lte: end } } },
       { $unwind: "$items" },
       {
         $group: {
           _id: "$items.product",
           productName: { $last: "$items.productName" },
           unitsSold: { $sum: "$items.quantity" },
-          purchaseCost: {
-            $sum: { $multiply: ["$items.costPrice", "$items.quantity"] },
-          },
-          otherCost: {
-            $sum: { $multiply: ["$items.additionalCost", "$items.quantity"] },
-          },
-          sellingTotal: {
-            $sum: { $multiply: ["$items.unitPrice", "$items.quantity"] },
-          },
+          purchaseCost: { $sum: { $multiply: ["$items.costPrice", "$items.quantity"] } },
+          otherCost: { $sum: { $multiply: ["$items.additionalCost", "$items.quantity"] } },
+          sellingTotal: { $sum: { $multiply: ["$items.unitPrice", "$items.quantity"] } },
         },
       },
-      {
-        $addFields: {
-          profit: {
-            $subtract: [
-              "$sellingTotal",
-              { $add: ["$purchaseCost", "$otherCost"] },
-            ],
-          },
-        },
-      },
-      { $sort: { profit: -1 } },
     ]);
+
+    const adjAgg = await ProfitAdjustment.aggregate([
+      ...adjustmentPipeline(start, end, "DELIVERED"),
+      { $group: { _id: "$product", adjustment: { $sum: "$amount" } } },
+    ]);
+    const adjMap = new Map(adjAgg.map((a) => [String(a._id), a.adjustment]));
+
+    for (const p of products) {
+      p.baseProfit = p.sellingTotal - p.purchaseCost - p.otherCost;
+      p.adjustment = adjMap.get(String(p._id)) || 0;
+      p.profit = p.baseProfit + p.adjustment;
+    }
+    products.sort((a, b) => b.profit - a.profit);
 
     const totals = products.reduce(
       (t, p) => ({
@@ -213,9 +218,10 @@ router.get("/product-profit", async (req, res, next) => {
         purchaseCost: t.purchaseCost + p.purchaseCost,
         otherCost: t.otherCost + p.otherCost,
         sellingTotal: t.sellingTotal + p.sellingTotal,
+        adjustment: t.adjustment + p.adjustment,
         profit: t.profit + p.profit,
       }),
-      { unitsSold: 0, purchaseCost: 0, otherCost: 0, sellingTotal: 0, profit: 0 },
+      { unitsSold: 0, purchaseCost: 0, otherCost: 0, sellingTotal: 0, adjustment: 0, profit: 0 },
     );
 
     res.json({ products, totals });
@@ -224,24 +230,25 @@ router.get("/product-profit", async (req, res, next) => {
   }
 });
 
-// Every individual delivered sale of one product (for the expandable rows)
 router.get("/product-profit/:productId", async (req, res, next) => {
   try {
     const { range = "this_month", from, to } = req.query;
     const { start, end } = dateRange(range, from, to);
+    const productId = req.params.productId;
 
     const orders = await Order.find({
       status: "DELIVERED",
       orderDate: { $gte: start, $lte: end },
-      "items.product": req.params.productId,
+      "items.product": productId,
     }).sort({ orderDate: -1 });
 
     const sales = [];
     for (const o of orders) {
       for (const it of o.items) {
-        if (String(it.product) !== req.params.productId) continue;
+        if (String(it.product) !== productId) continue;
         const qty = it.quantity || 1;
         sales.push({
+          orderId: o._id,
           orderNumber: o.orderNumber,
           date: o.orderDate,
           purchasePrice: it.costPrice,
@@ -252,7 +259,17 @@ router.get("/product-profit/:productId", async (req, res, next) => {
         });
       }
     }
-    res.json(sales);
+
+    const adjustments = await ProfitAdjustment.find({
+      product: productId,
+      isDeleted: false,
+      order: { $in: orders.map((o) => o._id) },
+    })
+      .populate("createdBy", "name")
+      .sort({ createdAt: -1 });
+
+    // The page now expects { sales, adjustments } instead of a plain array.
+    res.json({ sales, adjustments });
   } catch (err) {
     next(err);
   }

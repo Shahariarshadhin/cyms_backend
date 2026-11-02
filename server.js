@@ -61,6 +61,7 @@ app.use("/api/settings", require("./routes/settings"));
 app.use("/api/boosting-cost", require("./routes/boostingCost"));
 app.use("/api/research-products", require("./routes/researchProducts"));
 app.use("/api/audit", require("./routes/audit"));
+app.use("/api/profit-adjustments", require("./routes/profitAdjustments"));
 
 // Error handler
 app.use((err, req, res, next) => {
